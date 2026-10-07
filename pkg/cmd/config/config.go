@@ -6,6 +6,7 @@ import (
 
 	"github.com/cli/cli/v2/internal/config"
 	cmdClearCache "github.com/cli/cli/v2/pkg/cmd/config/clear-cache"
+	cmdDoctor "github.com/cli/cli/v2/pkg/cmd/config/doctor"
 	cmdGet "github.com/cli/cli/v2/pkg/cmd/config/get"
 	cmdList "github.com/cli/cli/v2/pkg/cmd/config/list"
 	cmdSet "github.com/cli/cli/v2/pkg/cmd/config/set"
@@ -40,6 +41,7 @@ func NewCmdConfig(f *cmdutil.Factory) *cobra.Command {
 	cmd.AddCommand(cmdSet.NewCmdConfigSet(f, nil))
 	cmd.AddCommand(cmdList.NewCmdConfigList(f, nil))
 	cmd.AddCommand(cmdClearCache.NewCmdConfigClearCache(f, nil))
+	cmd.AddCommand(cmdDoctor.NewCmdConfigDoctor(f, nil))
 
 	return cmd
 }

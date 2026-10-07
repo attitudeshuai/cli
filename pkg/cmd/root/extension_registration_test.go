@@ -99,3 +99,39 @@ func TestNewCmdRoot_ExtensionRegistration(t *testing.T) {
 		})
 	}
 }
+
+func TestNewCmdRoot_AliasRegistration(t *testing.T) {
+	ios, _, _, _ := iostreams.Test()
+
+	f := &cmdutil.Factory{
+		IOStreams: ios,
+		Config: func() (gh.Config, error) {
+			return config.NewMockConfigFromString(`
+aliases:
+  repo x: repo x
+  repo good: pr status
+`), nil
+		},
+		Browser: &browser.Stub{},
+		ExtensionManager: &extensions.ExtensionManagerMock{
+			ListFunc: func() []extensions.Extension {
+				return nil
+			},
+		},
+	}
+
+	cmd, err := NewCmdRoot(f, &telemetry.NoOpService{}, "", "")
+	require.NoError(t, err)
+
+	// The self-referential alias is registered as a broken alias.
+	cmd.SetArgs([]string{"repo", "x"})
+	_, err = cmd.ExecuteC()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `alias "repo x" is self-referential`)
+	assert.Contains(t, err.Error(), `gh alias delete "repo x"`)
+
+	// Unrelated aliases remain available.
+	foundCmd, _, findErr := cmd.Find([]string{"repo", "good"})
+	require.NoError(t, findErr)
+	assert.Equal(t, "alias", foundCmd.GroupID)
+}

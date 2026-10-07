@@ -110,6 +110,12 @@ func (c *cfg) Write() error {
 	return ghConfig.Write(c.cfg)
 }
 
+// RawConfig returns the underlying go-gh configuration for read-only traversal.
+// It backs package-internal validation and is not part of the gh.Config contract.
+func (c *cfg) RawConfig() *ghConfig.Config {
+	return c.cfg
+}
+
 func (c *cfg) Aliases() gh.AliasConfig {
 	return &AliasConfig{cfg: c.cfg}
 }
@@ -576,10 +582,6 @@ func (c *AuthConfig) TokenForUser(hostname, user string) (string, string, error)
 
 func keyringServiceName(hostname string) string {
 	return "gh:" + hostname
-}
-
-type AliasConfig struct {
-	cfg *ghConfig.Config
 }
 
 func (a *AliasConfig) Get(alias string) (string, error) {

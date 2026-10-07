@@ -3,7 +3,6 @@ package set
 import (
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 
 	"github.com/MakeNowJust/heredoc"
@@ -62,19 +61,17 @@ func NewCmdConfigSet(f *cmdutil.Factory, runF func(*SetOptions) error) *cobra.Co
 }
 
 func setRun(opts *SetOptions) error {
-	if err := validateScope(opts.Key, opts.Hostname); err != nil {
+	if err := config.ValidateScope(opts.Key, opts.Hostname); err != nil {
 		return cmdutil.FlagErrorf("%s", err)
 	}
 
-	err := ValidateKey(opts.Key)
-	if err != nil {
+	if err := config.ValidateKey(opts.Key); err != nil {
 		warningIcon := opts.IO.ColorScheme().WarningIcon()
 		fmt.Fprintf(opts.IO.ErrOut, "%s warning: '%s' is not a known configuration key\n", warningIcon, opts.Key)
 	}
 
-	err = ValidateValue(opts.Key, opts.Value)
-	if err != nil {
-		if invalidValue, ok := errors.AsType[InvalidValueError](err); ok {
+	if err := config.ValidateValue(opts.Key, opts.Value); err != nil {
+		if invalidValue, ok := errors.AsType[config.InvalidValueError](err); ok {
 			var values []string
 			for _, v := range invalidValue.ValidValues {
 				values = append(values, fmt.Sprintf("'%s'", v))
@@ -85,65 +82,24 @@ func setRun(opts *SetOptions) error {
 
 	opts.Config.Set(opts.Hostname, opts.Key, opts.Value)
 
-	err = opts.Config.Write()
+	err := opts.Config.Write()
 	if err != nil {
 		return fmt.Errorf("failed to write config to disk: %w", err)
 	}
 	return nil
 }
 
+// These thin wrappers preserve the package's validation surface for its tests.
+// The implementations live in internal/config so the configuration doctor and
+// the configuration loading path can share the same definitions.
 func ValidateKey(key string) error {
-	for _, configKey := range config.Options {
-		if key == configKey.Key {
-			return nil
-		}
-	}
-
-	return fmt.Errorf("invalid key")
+	return config.ValidateKey(key)
 }
 
 func validateScope(key, hostname string) error {
-	for _, configKey := range config.Options {
-		if key == configKey.Key {
-			switch {
-			case configKey.Scope == config.ConfigScopeHostOnly && hostname == "":
-				return fmt.Errorf("--host required when setting %s", key)
-			case configKey.Scope == config.ConfigScopeGlobalOnly && hostname != "":
-				return fmt.Errorf("--host cannot be used when setting %s", key)
-			default:
-				return nil
-			}
-		}
-	}
-
-	return nil
-}
-
-type InvalidValueError struct {
-	ValidValues []string
-}
-
-func (e InvalidValueError) Error() string {
-	return "invalid value"
+	return config.ValidateScope(key, hostname)
 }
 
 func ValidateValue(key, value string) error {
-	var validValues []string
-
-	for _, v := range config.Options {
-		if v.Key == key {
-			validValues = v.AllowedValues
-			break
-		}
-	}
-
-	if validValues == nil {
-		return nil
-	}
-
-	if slices.Contains(validValues, value) {
-		return nil
-	}
-
-	return InvalidValueError{ValidValues: validValues}
+	return config.ValidateValue(key, value)
 }

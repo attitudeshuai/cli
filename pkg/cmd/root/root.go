@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/MakeNowJust/heredoc"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/gh/ghtelemetry"
 	accessibilityCmd "github.com/cli/cli/v2/pkg/cmd/accessibility"
 	actionsCmd "github.com/cli/cli/v2/pkg/cmd/actions"
@@ -206,35 +207,48 @@ func NewCmdRoot(f *cmdutil.Factory, telemetry ghtelemetry.InvocationRecorder, ve
 
 	// Aliases
 	aliases := cfg.Aliases()
+	problemAliases := map[string]gh.AliasIssue{}
+	for _, issue := range aliases.Analyze().Issues {
+		problemAliases[issue.Name] = issue
+	}
 	validAliasName := shared.ValidAliasNameFunc(cmd)
 	validAliasExpansion := shared.ValidAliasExpansionFunc(cmd)
 	for k, v := range aliases.All() {
 		aliasName := k
 		aliasValue := v
-		if validAliasName(aliasName) && validAliasExpansion(aliasValue) {
-			split, _ := shlex.Split(aliasName)
-			parentCmd, parentArgs, _ := cmd.Find(split)
-			if !parentCmd.ContainsGroup("alias") {
-				parentCmd.AddGroup(&cobra.Group{
-					ID:    "alias",
-					Title: "Alias commands",
-				})
-			}
-			if strings.HasPrefix(aliasValue, "!") {
-				shellAliasCmd := NewCmdShellAlias(io, parentArgs[0], aliasValue)
-				parentCmd.AddCommand(shellAliasCmd)
-			} else {
-				aliasCmd := NewCmdAlias(io, parentArgs[0], aliasValue)
-				split, _ := shlex.Split(aliasValue)
-				child, _, _ := cmd.Find(split)
-				aliasCmd.SetUsageFunc(func(_ *cobra.Command) error {
-					return rootUsageFunc(f.IOStreams.ErrOut, child)
-				})
-				aliasCmd.SetHelpFunc(func(_ *cobra.Command, args []string) {
-					rootHelpFunc(f, child, args)
-				})
-				parentCmd.AddCommand(aliasCmd)
-			}
+		if !validAliasName(aliasName) {
+			continue
+		}
+		split, _ := shlex.Split(aliasName)
+		parentCmd, parentArgs, _ := cmd.Find(split)
+		if !parentCmd.ContainsGroup("alias") {
+			parentCmd.AddGroup(&cobra.Group{
+				ID:    "alias",
+				Title: "Alias commands",
+			})
+		}
+		if issue, broken := problemAliases[aliasName]; broken {
+			brokenAliasCmd := NewCmdBrokenAlias(io, parentArgs[0], issue, aliasValue)
+			parentCmd.AddCommand(brokenAliasCmd)
+			continue
+		}
+		if !validAliasExpansion(aliasValue) {
+			continue
+		}
+		if strings.HasPrefix(aliasValue, "!") {
+			shellAliasCmd := NewCmdShellAlias(io, parentArgs[0], aliasValue)
+			parentCmd.AddCommand(shellAliasCmd)
+		} else {
+			aliasCmd := NewCmdAlias(io, parentArgs[0], aliasName, aliasValue)
+			split, _ := shlex.Split(aliasValue)
+			child, _, _ := cmd.Find(split)
+			aliasCmd.SetUsageFunc(func(_ *cobra.Command) error {
+				return rootUsageFunc(f.IOStreams.ErrOut, child)
+			})
+			aliasCmd.SetHelpFunc(func(_ *cobra.Command, args []string) {
+				rootHelpFunc(f, child, args)
+			})
+			parentCmd.AddCommand(aliasCmd)
 		}
 	}
 

@@ -1,10 +1,16 @@
 package root
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestExpandAlias(t *testing.T) {
@@ -120,4 +126,67 @@ func TestExpandShellAlias(t *testing.T) {
 			assert.Equal(t, tt.wantExpanded, gotExpanded)
 		})
 	}
+}
+
+func TestNextAliasExpansionContext(t *testing.T) {
+	t.Run("decrements remaining depth and records chain", func(t *testing.T) {
+		ctx, err := nextAliasExpansionContext(context.Background(), "a", "pr status")
+		require.NoError(t, err)
+
+		state, ok := ctx.Value(aliasExpansionContextKey{}).(aliasExpansionState)
+		require.True(t, ok)
+		assert.Equal(t, config.MaxAliasExpansionDepth-1, state.remaining)
+		assert.Equal(t, []string{"a"}, state.chain)
+	})
+
+	t.Run("detects circular reference", func(t *testing.T) {
+		ctx, err := nextAliasExpansionContext(context.Background(), "a", "b")
+		require.NoError(t, err)
+		ctx, err = nextAliasExpansionContext(ctx, "b", "a")
+		require.NoError(t, err)
+
+		_, err = nextAliasExpansionContext(ctx, "a", "b")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "circular reference chain a -> b -> a")
+		assert.Contains(t, err.Error(), `gh alias delete "a"`)
+	})
+
+	t.Run("detects expansion depth exhaustion", func(t *testing.T) {
+		// State right at the boundary: the maximum number of expansions have
+		// already been followed, so the next alias must be rejected.
+		state := aliasExpansionState{
+			remaining: 0,
+			chain:     depthNames(config.MaxAliasExpansionDepth),
+		}
+		ctx := context.WithValue(context.Background(), aliasExpansionContextKey{}, state)
+
+		_, err := nextAliasExpansionContext(ctx, "deep", "pr status")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "expansion depth 11 exceeds the maximum depth 10")
+		assert.Contains(t, err.Error(), "simplify the alias chain")
+	})
+}
+
+func TestNewCmdBrokenAlias(t *testing.T) {
+	ios, _, _, _ := iostreams.Test()
+	issue := gh.AliasIssue{
+		Name:  "repo x",
+		Kind:  gh.AliasSelfReference,
+		Chain: []string{"repo x", "repo x"},
+	}
+	cmd := NewCmdBrokenAlias(ios, "x", issue, "repo x")
+
+	err := cmd.RunE(cmd, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `alias "repo x" is self-referential`)
+	assert.Contains(t, err.Error(), `gh alias delete "repo x"`)
+}
+
+// depthNames returns count zero-padded alias names a00, a01, and so on.
+func depthNames(count int) []string {
+	names := make([]string, 0, count)
+	for i := range count {
+		names = append(names, fmt.Sprintf("a%02d", i))
+	}
+	return names
 }

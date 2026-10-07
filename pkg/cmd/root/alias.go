@@ -1,13 +1,17 @@
 package root
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 
+	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/run"
 	"github.com/cli/cli/v2/internal/text"
 	"github.com/cli/cli/v2/pkg/cmdutil"
@@ -50,7 +54,7 @@ func NewCmdShellAlias(io *iostreams.IOStreams, aliasName, aliasValue string) *co
 	return cmd
 }
 
-func NewCmdAlias(io *iostreams.IOStreams, aliasName, aliasValue string) *cobra.Command {
+func NewCmdAlias(io *iostreams.IOStreams, aliasName, fullAliasName, aliasValue string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   aliasName,
 		Short: fmt.Sprintf("Alias for %q", text.Truncate(80, aliasValue)),
@@ -60,6 +64,11 @@ func NewCmdAlias(io *iostreams.IOStreams, aliasName, aliasValue string) *cobra.C
 				return err
 			}
 			root := c.Root()
+			ctx, err := nextAliasExpansionContext(c.Context(), fullAliasName, aliasValue)
+			if err != nil {
+				return err
+			}
+			root.SetContext(ctx)
 			root.SetArgs(expandedArgs)
 			return root.Execute()
 		},
@@ -75,6 +84,75 @@ func NewCmdAlias(io *iostreams.IOStreams, aliasName, aliasValue string) *cobra.C
 	// organization names).
 	cmdutil.DisableTelemetry(cmd)
 	return cmd
+}
+
+// NewCmdBrokenAlias registers an alias whose expansion failed validation when
+// the configuration was loaded. Invoking it reports the reason and how to fix
+// the alias instead of re-entering the command tree.
+func NewCmdBrokenAlias(io *iostreams.IOStreams, aliasName string, issue gh.AliasIssue, aliasValue string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   aliasName,
+		Short: fmt.Sprintf("Broken alias for %q", text.Truncate(80, aliasValue)),
+		RunE: func(c *cobra.Command, args []string) error {
+			return fmt.Errorf("%s; %s",
+				config.AliasIssueMessage(issue, aliasValue),
+				config.AliasIssueSuggestion(issue))
+		},
+		GroupID:            "alias",
+		DisableFlagParsing: true,
+	}
+	cmdutil.DisableAuthCheck(cmd)
+	cmdutil.DisableTelemetry(cmd)
+	return cmd
+}
+
+// aliasExpansionState tracks how many further alias expansions may be followed
+// and which aliases have already been expanded. It is carried through cobra's
+// execution context so each alias re-entry can enforce the same hard bound.
+type aliasExpansionState struct {
+	remaining int
+	chain     []string
+}
+
+type aliasExpansionContextKey struct{}
+
+// nextAliasExpansionContext validates the next alias re-entry and returns the
+// context carrying the updated state. It rejects a return to an already
+// expanded alias (a circular reference) and exhausting the remaining depth
+// (an overly deep chain), with the same readable messages as the doctor.
+func nextAliasExpansionContext(ctx context.Context, aliasName, aliasValue string) (context.Context, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	state := aliasExpansionState{remaining: config.MaxAliasExpansionDepth}
+	if s, ok := ctx.Value(aliasExpansionContextKey{}).(aliasExpansionState); ok {
+		state = s
+	}
+
+	var issue gh.AliasIssue
+	switch {
+	case slices.Contains(state.chain, aliasName):
+		issue = gh.AliasIssue{
+			Name:  aliasName,
+			Kind:  gh.AliasCircularReference,
+			Chain: append(slices.Clone(state.chain), aliasName),
+		}
+	case state.remaining <= 0:
+		issue = gh.AliasIssue{
+			Name:  aliasName,
+			Kind:  gh.AliasExpansionDepthExceeded,
+			Depth: config.MaxAliasExpansionDepth + 1,
+		}
+	default:
+		state.remaining--
+		state.chain = append(slices.Clone(state.chain), aliasName)
+		return context.WithValue(ctx, aliasExpansionContextKey{}, state), nil
+	}
+
+	return nil, fmt.Errorf("%s; %s",
+		config.AliasIssueMessage(issue, aliasValue),
+		config.AliasIssueSuggestion(issue))
 }
 
 // ExpandAlias processes argv to see if it should be rewritten according to a user's aliases.

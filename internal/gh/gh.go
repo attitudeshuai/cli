@@ -229,4 +229,46 @@ type AliasConfig interface {
 
 	// All returns a map of all aliases to their corresponding expansions.
 	All() map[string]string
+
+	// Analyze validates every alias expansion for self references, circular
+	// references, and expansion depth, returning the problematic aliases and the
+	// expansion depth per alias. The result is computed once and cached.
+	Analyze() AliasAnalysis
+}
+
+// AliasIssueKind categorizes a problem found while validating alias expansions.
+type AliasIssueKind string
+
+const (
+	// AliasSelfReference indicates an alias whose expansion returns directly to itself.
+	AliasSelfReference AliasIssueKind = "self_reference"
+	// AliasCircularReference indicates an alias whose expansion chain returns to a
+	// previously expanded alias, including aliases that lead into such a chain.
+	AliasCircularReference AliasIssueKind = "circular_reference"
+	// AliasExpansionDepthExceeded indicates an alias whose expansion chain is longer
+	// than the configured maximum depth.
+	AliasExpansionDepthExceeded AliasIssueKind = "expansion_depth_exceeded"
+)
+
+// AliasIssue describes a problem with one alias expansion.
+type AliasIssue struct {
+	// Name is the alias with the problem.
+	Name string
+	// Kind is the problem category.
+	Kind AliasIssueKind
+	// Chain lists the alias names traversed while demonstrating the problem. For a
+	// circular reference it repeats the first repeated name at the end.
+	Chain []string
+	// Depth is the computed expansion depth in alias hops for over-deep expansions.
+	// It is zero for self referential or circular aliases.
+	Depth int
+}
+
+// AliasAnalysis is the result of validating all alias expansions.
+type AliasAnalysis struct {
+	// Issues lists one problem per problematic alias.
+	Issues []AliasIssue
+	// Depths records the expansion depth in alias hops for every alias with a finite
+	// expansion. Aliases in a circular chain are absent.
+	Depths map[string]int
 }

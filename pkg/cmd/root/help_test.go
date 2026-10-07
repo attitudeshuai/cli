@@ -139,7 +139,7 @@ func TestWriteHelp_aliasResolution(t *testing.T) {
 
 	t.Run("configured alias renders the target command help", func(t *testing.T) {
 		rootCmd, ios := newRoot()
-		aliasCmd := NewCmdAlias(ios, "prs", "pr list")
+		aliasCmd := NewCmdAlias(ios, "prs", "prs", "pr list")
 		rootCmd.AddCommand(aliasCmd)
 
 		var buf bytes.Buffer
@@ -153,7 +153,7 @@ func TestWriteHelp_aliasResolution(t *testing.T) {
 
 	t.Run("alias expansion carrying flags still resolves to the target", func(t *testing.T) {
 		rootCmd, ios := newRoot()
-		aliasCmd := NewCmdAlias(ios, "prs", "pr list --limit 5")
+		aliasCmd := NewCmdAlias(ios, "prs", "prs", "pr list --limit 5")
 		rootCmd.AddCommand(aliasCmd)
 
 		var buf bytes.Buffer
@@ -175,7 +175,7 @@ func TestWriteHelp_aliasResolution(t *testing.T) {
 
 	t.Run("alias expanding to an unknown command falls back to the alias", func(t *testing.T) {
 		rootCmd, ios := newRoot()
-		aliasCmd := NewCmdAlias(ios, "zz", "nope missing")
+		aliasCmd := NewCmdAlias(ios, "zz", "zz", "nope missing")
 		rootCmd.AddCommand(aliasCmd)
 
 		var buf bytes.Buffer
