@@ -55,11 +55,15 @@ func TestNewCmdRun(t *testing.T) {
 			},
 		},
 		{
-			name:     "both STDIN and input fields",
-			stdin:    "some json",
-			cli:      "workflow.yml -fhey=there --json",
-			errMsg:   "only one of STDIN or -f/-F can be passed",
-			wantsErr: true,
+			name: "both STDIN and input fields",
+			stdin: "some json",
+			cli:  "workflow.yml -fhey=there --json",
+			wants: RunOptions{
+				Selector:  "workflow.yml",
+				RawFields: []string{"hey=there"},
+				JSON:      true,
+				JSONInput: "some json",
+			},
 		},
 		{
 			name: "-f args",
@@ -98,6 +102,52 @@ func TestNewCmdRun(t *testing.T) {
 				JSONInput: `{"cool":"yeah"}`,
 				Selector:  "workflow.yml",
 			},
+		},
+		{
+			name: "dry run",
+			tty:  true,
+			cli:  "workflow.yml --dry-run",
+			wants: RunOptions{
+				Selector:      "workflow.yml",
+				DryRun:        true,
+				DryRunFormat:  "human",
+				OnDefinitionError: "proceed",
+			},
+		},
+		{
+			name:  "dry run json format with fields",
+			cli:   "workflow.yml -fhey=there --dry-run --dry-run-format json",
+			stdin: "",
+			tty:   true,
+			wants: RunOptions{
+				Selector:      "workflow.yml",
+				RawFields:     []string{"hey=there"},
+				DryRun:        true,
+				DryRunFormat:  "json",
+				OnDefinitionError: "proceed",
+			},
+		},
+		{
+			name:     "dry run format requires dry run",
+			cli:      "workflow.yml --dry-run-format json",
+			tty:      true,
+			wantsErr: true,
+			errMsg:   "--dry-run-format can only be used with --dry-run",
+		},
+		{
+			name: "on definition error stop",
+			tty:  true,
+			cli:  "workflow.yml --on-definition-error stop",
+			wants: RunOptions{
+				Selector:          "workflow.yml",
+				OnDefinitionError: "stop",
+			},
+		},
+		{
+			name:     "on definition error invalid value",
+			cli:      "workflow.yml --on-definition-error whatever",
+			tty:      true,
+			wantsErr: true,
 		},
 	}
 
@@ -144,6 +194,17 @@ func TestNewCmdRun(t *testing.T) {
 			assert.Equal(t, tt.wants.JSONInput, gotOpts.JSONInput)
 			assert.Equal(t, tt.wants.JSON, gotOpts.JSON)
 			assert.Equal(t, tt.wants.Ref, gotOpts.Ref)
+			assert.Equal(t, tt.wants.DryRun, gotOpts.DryRun)
+			wantDryRunFormat := tt.wants.DryRunFormat
+			if wantDryRunFormat == "" {
+				wantDryRunFormat = dryRunFormatHuman
+			}
+			assert.Equal(t, wantDryRunFormat, gotOpts.DryRunFormat)
+			wantPolicy := tt.wants.OnDefinitionError
+			if wantPolicy == "" {
+				wantPolicy = definitionErrorProceed
+			}
+			assert.Equal(t, wantPolicy, gotOpts.OnDefinitionError)
 			assert.ElementsMatch(t, tt.wants.RawFields, gotOpts.RawFields)
 			assert.ElementsMatch(t, tt.wants.MagicFields, gotOpts.MagicFields)
 		})
@@ -396,14 +457,69 @@ jobs:
     run: echo "${{ github.event.inputs.message }} ${{ fromJSON('["", "🥳"]')[github.event.inputs.use-emoji == 'true'] }} ${{ github.event.inputs.name }}"`)
 	encodedYAMLContentMissingChoiceIp := base64.StdEncoding.EncodeToString(yamlContentMissingChoiceIp)
 
-	// Old GitHub API servers return 204 No Content for successful workflow dispatches.
-	stubs := func(reg *httpmock.Registry) {
+	// A workflow that declares optional "greeting" and "name" inputs, so any
+	// subset of the happy-path inputs reconciles cleanly.
+	reconcilableYAMLContent := []byte(`
+name: a workflow
+on:
+  workflow_dispatch:
+    inputs:
+      greeting:
+        type: string
+      name:
+        type: string
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+`)
+	encodedReconcilableYAMLContent := base64.StdEncoding.EncodeToString(reconcilableYAMLContent)
+
+	// A workflow that declares a required choice input "env".
+	choiceYAMLContent := []byte(`
+name: choice workflow
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        type: choice
+        required: true
+        options:
+        - dev
+        - prod
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+`)
+	encodedChoiceYAMLContent := base64.StdEncoding.EncodeToString(choiceYAMLContent)
+
+	// A workflow file without a workflow_dispatch event.
+	notDispatchYAMLContent := []byte("name: workflow\non: pull_request\n")
+	encodedNotDispatchYAMLContent := base64.StdEncoding.EncodeToString(notDispatchYAMLContent)
+
+	// A workflow file whose inputs section cannot be parsed.
+	malformedYAMLContent := []byte("name: workflow\non:\n workflow_dispatch:\n  inputs: lol\n")
+	encodedMalformedYAMLContent := base64.StdEncoding.EncodeToString(malformedYAMLContent)
+
+	registerWorkflow := func(reg *httpmock.Registry) {
 		reg.Register(
 			httpmock.REST("GET", "repos/OWNER/REPO/actions/workflows/workflow.yml"),
 			httpmock.JSONResponse(shared.Workflow{
 				Path: ".github/workflows/workflow.yml",
 				ID:   12345,
 			}))
+	}
+	registerContents := func(reg *httpmock.Registry, encoded string) {
+		reg.Register(
+			httpmock.REST("GET", "repos/OWNER/REPO/contents/.github%2Fworkflows%2Fworkflow.yml"),
+			httpmock.JSONResponse(struct{ Content string }{
+				Content: encoded,
+			}))
+	}
+
+	// Old GitHub API servers return 204 No Content for successful workflow dispatches.
+	stubs := func(reg *httpmock.Registry) {
+		registerWorkflow(reg)
+		registerContents(reg, encodedReconcilableYAMLContent)
 		reg.Register(
 			httpmock.REST("POST", "repos/OWNER/REPO/actions/workflows/12345/dispatches"),
 			httpmock.StatusStringResponse(204, "cool"))
@@ -412,12 +528,8 @@ jobs:
 	// Current GitHub API servers return 200 OK with run info for successful workflow dispatches,
 	// if `return_run_details` is enabled in the request body.
 	stubsWithRunInfo := func(reg *httpmock.Registry) {
-		reg.Register(
-			httpmock.REST("GET", "repos/OWNER/REPO/actions/workflows/workflow.yml"),
-			httpmock.JSONResponse(shared.Workflow{
-				Path: ".github/workflows/workflow.yml",
-				ID:   12345,
-			}))
+		registerWorkflow(reg)
+		registerContents(reg, encodedReconcilableYAMLContent)
 		reg.Register(
 			httpmock.REST("POST", "repos/OWNER/REPO/actions/workflows/12345/dispatches"),
 			httpmock.StatusJSONResponse(200, map[string]any{
@@ -428,15 +540,17 @@ jobs:
 	}
 
 	tests := []struct {
-		name        string
-		opts        *RunOptions
-		tty         bool
-		wantErr     bool
-		errOut      string
-		wantOut     string
-		wantBody    map[string]any
-		httpStubs   func(*httpmock.Registry)
-		promptStubs func(*prompter.MockPrompter)
+		name           string
+		opts           *RunOptions
+		tty            bool
+		wantErr        bool
+		errOut         string
+		wantOut        string
+		wantErrOut     string
+		wantBody       map[string]any
+		wantNoDispatch bool
+		httpStubs      func(*httpmock.Registry)
+		promptStubs    func(*prompter.MockPrompter)
 	}{
 		{
 			name: "bad JSON",
@@ -623,8 +737,7 @@ jobs:
 			`),
 		},
 		{
-			// TODO this test is somewhat silly; it's more of a placeholder in case I decide to handle the API error more elegantly
-			name: "good JSON, missing required input",
+			name: "missing required input is blocked before dispatch",
 			tty:  true,
 			opts: &RunOptions{
 				Selector:  "workflow.yml",
@@ -632,25 +745,13 @@ jobs:
 				Detector:  &fd.EnabledDetectorMock{},
 			},
 			httpStubs: func(reg *httpmock.Registry) {
-				reg.Register(
-					httpmock.REST("GET", "repos/OWNER/REPO/actions/workflows/workflow.yml"),
-					httpmock.JSONResponse(shared.Workflow{
-						Path: ".github/workflows/workflow.yml",
-						ID:   12345,
-					}))
-				reg.Register(
-					httpmock.REST("POST", "repos/OWNER/REPO/actions/workflows/12345/dispatches"),
-					httpmock.StatusStringResponse(422, "missing something"))
+				registerWorkflow(reg)
+				// yamlContent declares "name" as required with no default.
+				registerContents(reg, encodedYAMLContent)
 			},
-			wantBody: map[string]any{
-				"inputs": map[string]any{
-					"greeting": "hello there",
-				},
-				"ref":                "trunk",
-				"return_run_details": true,
-			},
-			wantErr: true,
-			errOut:  "could not create workflow dispatch event: HTTP 422 (https://api.github.com/repos/OWNER/REPO/actions/workflows/12345/dispatches)",
+			wantNoDispatch: true,
+			wantErr:        true,
+			errOut:         "cannot dispatch workflow.yml at trunk: provided inputs do not match its workflow_dispatch declaration:\n- required input \"name\" was not provided and declares no default",
 		},
 		{
 			name: "yaml file extension",
@@ -680,26 +781,19 @@ jobs:
 			wantOut: "https://github.com/OWNER/REPO/actions/runs/6789\n",
 		},
 		{
-			// TODO this test is somewhat silly; it's more of a placeholder in case I decide to handle the API error more elegantly
-			name: "input fields, missing required",
+			name: "input fields missing required are blocked before dispatch",
 			opts: &RunOptions{
 				Selector:  "workflow.yml",
 				RawFields: []string{`greeting="hello there"`},
 				Detector:  &fd.EnabledDetectorMock{},
 			},
 			httpStubs: func(reg *httpmock.Registry) {
-				reg.Register(
-					httpmock.REST("GET", "repos/OWNER/REPO/actions/workflows/workflow.yml"),
-					httpmock.JSONResponse(shared.Workflow{
-						Path: ".github/workflows/workflow.yml",
-						ID:   12345,
-					}))
-				reg.Register(
-					httpmock.REST("POST", "repos/OWNER/REPO/actions/workflows/12345/dispatches"),
-					httpmock.StatusStringResponse(422, "missing something"))
+				registerWorkflow(reg)
+				registerContents(reg, encodedYAMLContent)
 			},
-			wantErr: true,
-			errOut:  "could not create workflow dispatch event: HTTP 422 (https://api.github.com/repos/OWNER/REPO/actions/workflows/12345/dispatches)",
+			wantNoDispatch: true,
+			wantErr:        true,
+			errOut:         "cannot dispatch workflow.yml at trunk: provided inputs do not match its workflow_dispatch declaration:\n- required input \"name\" was not provided and declares no default",
 		},
 		{
 			name: "prompt, no workflows enabled",
@@ -1107,6 +1201,405 @@ jobs:
 			wantErr: true,
 			errOut:  "workflow input \"name\" is of type choice, but has no options",
 		},
+		{
+			name: "undeclared input blocks dispatch",
+			opts: &RunOptions{
+				Selector:  "workflow.yml",
+				JSONInput: `{"nme":"scully"}`,
+				Detector:  &fd.EnabledDetectorMock{},
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				registerWorkflow(reg)
+				registerContents(reg, encodedReconcilableYAMLContent)
+			},
+			wantNoDispatch: true,
+			wantErr:        true,
+			errOut: `cannot dispatch workflow.yml at trunk: provided inputs do not match its workflow_dispatch declaration:
+- undeclared input "nme" is not accepted by workflow.yml (declared inputs: greeting, name)`,
+		},
+		{
+			name: "invalid choice blocks dispatch",
+			opts: &RunOptions{
+				Selector:  "workflow.yml",
+				RawFields: []string{"env=qa"},
+				Detector:  &fd.EnabledDetectorMock{},
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				registerWorkflow(reg)
+				registerContents(reg, encodedChoiceYAMLContent)
+			},
+			wantNoDispatch: true,
+			wantErr:        true,
+			errOut: `cannot dispatch workflow.yml at trunk: provided inputs do not match its workflow_dispatch declaration:
+- value "qa" for choice input "env" is not one of the allowed values: dev, prod`,
+		},
+		{
+			name: "duplicate input from flags and stdin blocks dispatch",
+			opts: &RunOptions{
+				Selector:  "workflow.yml",
+				RawFields: []string{"name=x"},
+				JSONInput: `{"name":"y"}`,
+				Detector:  &fd.EnabledDetectorMock{},
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				registerWorkflow(reg)
+				registerContents(reg, encodedReconcilableYAMLContent)
+			},
+			wantNoDispatch: true,
+			wantErr:        true,
+			errOut: `cannot dispatch workflow.yml at trunk: provided inputs do not match its workflow_dispatch declaration:
+- input "name" was provided more than once: from command-line flags the value was "x"; from JSON on standard input the value was "y", and it is unclear which value should be submitted`,
+		},
+		{
+			name: "flags and stdin inputs are merged for dispatch",
+			opts: &RunOptions{
+				Selector:    "workflow.yml",
+				RawFields:   []string{"greeting=hey"},
+				JSONInput:   `{"name":"scully"}`,
+				Detector:    &fd.EnabledDetectorMock{},
+			},
+			wantBody: map[string]any{
+				"inputs": map[string]any{
+					"greeting": "hey",
+					"name":     "scully",
+				},
+				"ref":                "trunk",
+				"return_run_details": true,
+			},
+			httpStubs: stubsWithRunInfo,
+			wantOut:   "https://github.com/OWNER/REPO/actions/runs/6789\n",
+		},
+		{
+			name: "valid choice dispatches unchanged",
+			opts: &RunOptions{
+				Selector:  "workflow.yml",
+				RawFields: []string{"env=prod"},
+				Detector:  &fd.EnabledDetectorMock{},
+			},
+			wantBody: map[string]any{
+				"inputs":             map[string]any{"env": "prod"},
+				"ref":                "trunk",
+				"return_run_details": true,
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				registerWorkflow(reg)
+				registerContents(reg, encodedChoiceYAMLContent)
+				reg.Register(
+					httpmock.REST("POST", "repos/OWNER/REPO/actions/workflows/12345/dispatches"),
+					httpmock.StatusJSONResponse(200, map[string]any{
+						"workflow_run_id": int64(6789),
+						"html_url":        "https://github.com/OWNER/REPO/actions/runs/6789",
+					}))
+			},
+			wantOut: "https://github.com/OWNER/REPO/actions/runs/6789\n",
+		},
+		{
+			// Defaults stay server-side: the submitted inputs must be exactly
+			// what the user provided.
+			name: "declared defaults are not injected into dispatch",
+			tty:  true,
+			opts: &RunOptions{
+				Selector:  "workflow.yml",
+				JSONInput: `{"name":"scully"}`,
+				Detector:  &fd.DisabledDetectorMock{},
+			},
+			wantBody: map[string]any{
+				"inputs": map[string]any{
+					"name": "scully",
+				},
+				"ref": "trunk",
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				registerWorkflow(reg)
+				registerContents(reg, encodedYAMLContent)
+				reg.Register(
+					httpmock.REST("POST", "repos/OWNER/REPO/actions/workflows/12345/dispatches"),
+					httpmock.StatusStringResponse(204, "cool"))
+			},
+			wantOut: heredoc.Doc(`
+				✓ Created workflow_dispatch event for workflow.yml at trunk
+
+				To see runs for this workflow, try: gh run list --workflow="workflow.yml"
+			`),
+		},
+		{
+			name: "dry run ok prints conclusion without dispatch",
+			opts: &RunOptions{
+				Selector:  "workflow.yml",
+				JSONInput: `{"name":"scully"}`,
+				DryRun:    true,
+				Detector:  &fd.EnabledDetectorMock{},
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				registerWorkflow(reg)
+				registerContents(reg, encodedReconcilableYAMLContent)
+			},
+			wantNoDispatch: true,
+			wantOut: heredoc.Doc(`
+				Input reconciliation for workflow.yml at trunk
+
+				Declared inputs:
+				- greeting (string, optional)
+				- name (string, optional)
+
+				Provided inputs:
+				- name=scully (from JSON on standard input)
+
+				Result: all provided inputs match the workflow declaration; nothing was submitted.
+			`),
+		},
+		{
+			name: "dry run mismatch exits non-zero without dispatch",
+			opts: &RunOptions{
+				Selector:  "workflow.yml",
+				JSONInput: `{"greeting":"hello there"}`,
+				DryRun:    true,
+				Detector:  &fd.EnabledDetectorMock{},
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				registerWorkflow(reg)
+				registerContents(reg, encodedYAMLContent)
+			},
+			wantNoDispatch: true,
+			wantErr:        true,
+			errOut:         cmdutil.SilentError.Error(),
+			wantOut: heredoc.Doc(`
+				Input reconciliation for workflow.yml at trunk
+
+				Declared inputs:
+				- greeting (string, optional; default: hi) - a greeting
+				- name (string, required; missing value) - a name
+
+				Provided inputs:
+				- greeting=hello there (from JSON on standard input)
+
+				Inputs not provided; declared defaults will be used:
+				- greeting (default: hi)
+
+				Problems:
+				- required input "name" was not provided and declares no default
+
+				Result: reconciliation found 1 problem(s); nothing was submitted.
+			`),
+		},
+		{
+			name: "dry run json ok",
+			opts: &RunOptions{
+				Selector:      "workflow.yml",
+				JSONInput:     `{"name":"scully"}`,
+				DryRun:        true,
+				DryRunFormat:  "json",
+				Detector:      &fd.EnabledDetectorMock{},
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				registerWorkflow(reg)
+				registerContents(reg, encodedReconcilableYAMLContent)
+			},
+			wantNoDispatch: true,
+			wantOut: heredoc.Doc(`
+				{
+				  "workflow": "workflow.yml",
+				  "ref": "trunk",
+				  "status": "ok",
+				  "complete": true,
+				  "declared_inputs": [
+				    {
+				      "name": "greeting",
+				      "type": "string",
+				      "required": false,
+				      "has_default": false,
+				      "options": [],
+				      "status": "optional_unset",
+				      "provided": []
+				    },
+				    {
+				      "name": "name",
+				      "type": "string",
+				      "required": false,
+				      "has_default": false,
+				      "options": [],
+				      "status": "provided",
+				      "provided": [
+				        {
+				          "value": "scully",
+				          "source": "stdin"
+				        }
+				      ]
+				    }
+				  ],
+				  "provided_inputs": [
+				    {
+				      "name": "name",
+				      "declared": true,
+				      "status": "ok",
+				      "options": [],
+				      "values": [
+				        {
+				          "value": "scully",
+				          "source": "stdin"
+				        }
+				      ]
+				    }
+				  ],
+				  "defaulted_inputs": [],
+				  "findings": []
+				}
+			`),
+		},
+		{
+			name: "dry run says no inputs are needed",
+			opts: &RunOptions{
+				Selector: "workflow.yml",
+				DryRun:   true,
+				Detector: &fd.EnabledDetectorMock{},
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				registerWorkflow(reg)
+				registerContents(reg, encodedNoInputsYAMLContent)
+			},
+			wantNoDispatch: true,
+			wantOut: heredoc.Doc(`
+				Input reconciliation for workflow.yml at trunk
+
+				workflow.yml declares no workflow_dispatch inputs; none are needed to trigger it.
+
+				Result: all provided inputs match the workflow declaration; nothing was submitted.
+			`),
+		},
+		{
+			name: "dry run without inputs reports missing required inputs",
+			opts: &RunOptions{
+				Selector: "workflow.yml",
+				DryRun:   true,
+				Detector: &fd.EnabledDetectorMock{},
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				registerWorkflow(reg)
+				registerContents(reg, encodedYAMLContent)
+			},
+			wantNoDispatch: true,
+			wantErr:        true,
+			errOut:         cmdutil.SilentError.Error(),
+			wantOut: heredoc.Doc(`
+				Input reconciliation for workflow.yml at trunk
+
+				Declared inputs:
+				- greeting (string, optional; default: hi) - a greeting
+				- name (string, required; missing value) - a name
+
+				Inputs not provided; declared defaults will be used:
+				- greeting (default: hi)
+
+				Problems:
+				- required input "name" was not provided and declares no default
+
+				Result: reconciliation found 1 problem(s); nothing was submitted.
+			`),
+		},
+		{
+			name: "missing definition stops when policy is stop",
+			opts: &RunOptions{
+				Selector:          "workflow.yml",
+				JSONInput:         `{"name":"scully"}`,
+				OnDefinitionError: definitionErrorStop,
+				Detector:          &fd.EnabledDetectorMock{},
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				registerWorkflow(reg)
+				reg.Register(
+					httpmock.REST("GET", "repos/OWNER/REPO/contents/.github%2Fworkflows%2Fworkflow.yml"),
+					httpmock.StatusStringResponse(404, "not found"))
+			},
+			wantNoDispatch: true,
+			wantErr:        true,
+			errOut:         `cannot dispatch workflow.yml at trunk: input reconciliation could not be completed: the workflow file ".github/workflows/workflow.yml" could not be found on ref "trunk"`,
+		},
+		{
+			name: "missing definition proceeds with warning by default",
+			opts: &RunOptions{
+				Selector:  "workflow.yml",
+				JSONInput: `{"name":"scully"}`,
+				Detector:  &fd.DisabledDetectorMock{},
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				registerWorkflow(reg)
+				reg.Register(
+					httpmock.REST("GET", "repos/OWNER/REPO/contents/.github%2Fworkflows%2Fworkflow.yml"),
+					httpmock.StatusStringResponse(404, "not found"))
+				reg.Register(
+					httpmock.REST("POST", "repos/OWNER/REPO/actions/workflows/12345/dispatches"),
+					httpmock.StatusStringResponse(204, "cool"))
+			},
+			wantBody: map[string]any{
+				"inputs": map[string]any{"name": "scully"},
+				"ref":    "trunk",
+			},
+			wantErrOut: "warning: input reconciliation for workflow.yml at trunk could not be completed: " +
+				`the workflow file ".github/workflows/workflow.yml" could not be found on ref "trunk"; submitting inputs unchanged` + "\n",
+		},
+		{
+			name: "non-dispatch workflow stops when policy is stop",
+			opts: &RunOptions{
+				Selector:          "workflow.yml",
+				JSONInput:         `{"name":"scully"}`,
+				OnDefinitionError: definitionErrorStop,
+				Detector:          &fd.EnabledDetectorMock{},
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				registerWorkflow(reg)
+				registerContents(reg, encodedNotDispatchYAMLContent)
+			},
+			wantNoDispatch: true,
+			wantErr:        true,
+			errOut:         `cannot dispatch workflow.yml at trunk: input reconciliation could not be completed: the workflow file does not declare a workflow_dispatch event, so it cannot be manually triggered`,
+		},
+		{
+			name: "malformed definition proceeds with warning and unchanged inputs",
+			opts: &RunOptions{
+				Selector:  "workflow.yml",
+				JSONInput: `{"name":"scully"}`,
+				Detector:  &fd.DisabledDetectorMock{},
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				registerWorkflow(reg)
+				registerContents(reg, encodedMalformedYAMLContent)
+				reg.Register(
+					httpmock.REST("POST", "repos/OWNER/REPO/actions/workflows/12345/dispatches"),
+					httpmock.StatusStringResponse(204, "cool"))
+			},
+			wantBody: map[string]any{
+				"inputs": map[string]any{"name": "scully"},
+				"ref":    "trunk",
+			},
+			wantErrOut: "warning: input reconciliation for workflow.yml at trunk could not be completed: " +
+				"could not parse the workflow definition: could not decode workflow inputs: yaml: unmarshal errors:\n" +
+				"  line 4: cannot unmarshal !!str `lol` into map[string]run.WorkflowInput; submitting inputs unchanged\n",
+		},
+		{
+			name: "dry run reports incomplete definition without dispatch",
+			opts: &RunOptions{
+				Selector: "workflow.yml",
+				DryRun:   true,
+				Detector: &fd.EnabledDetectorMock{},
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				registerWorkflow(reg)
+				reg.Register(
+					httpmock.REST("GET", "repos/OWNER/REPO/contents/.github%2Fworkflows%2Fworkflow.yml"),
+					httpmock.StatusStringResponse(404, "not found"))
+			},
+			wantNoDispatch: true,
+			wantErr:        true,
+			errOut:         cmdutil.SilentError.Error(),
+			wantOut: heredoc.Doc(`
+				Input reconciliation for workflow.yml at trunk
+
+				Reconciliation status: incomplete
+				Reason: the workflow file ".github/workflows/workflow.yml" could not be found on ref "trunk"
+
+				Result: inputs were not reconciled; nothing was submitted.
+			`),
+		},
 	}
 
 	for _, tt := range tests {
@@ -1120,7 +1613,7 @@ jobs:
 				return &http.Client{Transport: reg}, nil
 			}
 
-			ios, _, stdout, _ := iostreams.Test()
+			ios, _, stdout, stderr := iostreams.Test()
 			ios.SetStdinTTY(tt.tty)
 			ios.SetStdoutTTY(tt.tty)
 			tt.opts.IO = ios
@@ -1138,14 +1631,28 @@ jobs:
 				tt.promptStubs(pm)
 			}
 
+			assertNoDispatch := func() {
+				for _, req := range reg.Requests {
+					assert.NotEqual(t, "POST", req.Method, "no dispatch event should be created")
+				}
+			}
+
 			err := runRun(tt.opts)
 			if tt.wantErr {
 				assert.Error(t, err)
 				assert.Equal(t, tt.errOut, err.Error())
+				if tt.wantNoDispatch {
+					assertNoDispatch()
+				}
+				assert.Equal(t, tt.wantErrOut, stderr.String())
 				return
 			}
 			assert.NoError(t, err)
 			assert.Equal(t, tt.wantOut, stdout.String())
+			assert.Equal(t, tt.wantErrOut, stderr.String())
+			if tt.wantNoDispatch {
+				assertNoDispatch()
+			}
 
 			if len(reg.Requests) > 0 {
 				lastRequest := reg.Requests[len(reg.Requests)-1]

@@ -41,7 +41,24 @@ type RunOptions struct {
 	RawFields   []string
 
 	Prompt bool
+
+	// DryRun reconciles the provided inputs against the inputs the workflow
+	// declares on the target ref without creating a dispatch event.
+	DryRun bool
+	// DryRunFormat selects human or JSON output for the dry run report.
+	DryRunFormat string
+	// OnDefinitionError controls submit mode when the workflow definition
+	// cannot be read or parsed: "proceed" submits unchanged, "stop" aborts.
+	OnDefinitionError string
 }
+
+const (
+	dryRunFormatHuman = "human"
+	dryRunFormatJSON  = "json"
+
+	definitionErrorProceed = "proceed"
+	definitionErrorStop    = "stop"
+)
 
 type iprompter interface {
 	Input(string, string) (string, error)
@@ -70,6 +87,15 @@ func NewCmdRun(f *cmdutil.Factory, runF func(*RunOptions) error) *cobra.Command 
 			- Via %[1]s-f/--raw-field%[1]s or %[1]s-F/--field%[1]s flags
 			- As JSON, via standard input
 
+			Both flags and JSON input may be passed together; an input provided by both at
+			once is reported instead of submitted.
+
+			Before dispatching, inputs provided via flags or standard input are reconciled
+			against the workflow_dispatch inputs declared by the workflow on the target ref:
+			undeclared input names, missing required inputs, and choice values outside the
+			declared options stop the dispatch. Use %[1]s--dry-run%[1]s to review the
+			reconciliation conclusion without creating a run.
+
 			The created workflow run URL will be returned if available.
 		`, "`"),
 		Example: heredoc.Doc(`
@@ -87,6 +113,12 @@ func NewCmdRun(f *cmdutil.Factory, runF func(*RunOptions) error) *cobra.Command 
 
 			# Run the workflow file 'triage.yml' with JSON via standard input
 			$ echo '{"name":"scully", "greeting":"hello"}' | gh workflow run triage.yml --json
+
+			# Check the inputs against the workflow declaration without triggering it
+			$ gh workflow run triage.yml -f name=scully --dry-run
+
+			# Check the inputs and emit a machine-readable, per-item conclusion
+			$ gh workflow run triage.yml -f name=scully --dry-run --dry-run-format json
 		`),
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(opts.MagicFields)+len(opts.RawFields) > 0 && len(args) == 0 {
@@ -97,8 +129,6 @@ func NewCmdRun(f *cmdutil.Factory, runF func(*RunOptions) error) *cobra.Command 
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// support `-R, --repo` override
 			opts.BaseRepo = f.BaseRepo
-
-			inputFieldsPassed := len(opts.MagicFields)+len(opts.RawFields) > 0
 
 			if len(args) > 0 {
 				opts.Selector = args[0]
@@ -118,14 +148,12 @@ func NewCmdRun(f *cmdutil.Factory, runF func(*RunOptions) error) *cobra.Command 
 				return cmdutil.FlagErrorf("--json specified but nothing on STDIN")
 			}
 
-			if opts.Selector == "" {
-				if opts.JSONInput != "" {
-					return cmdutil.FlagErrorf("workflow argument required when passing JSON")
-				}
-			} else {
-				if opts.JSON && inputFieldsPassed {
-					return cmdutil.FlagErrorf("only one of STDIN or -f/-F can be passed")
-				}
+			if opts.Selector == "" && opts.JSONInput != "" {
+				return cmdutil.FlagErrorf("workflow argument required when passing JSON")
+			}
+
+			if cmd.Flags().Changed("dry-run-format") && !opts.DryRun {
+				return cmdutil.FlagErrorf("--dry-run-format can only be used with --dry-run")
 			}
 
 			if runF != nil {
@@ -139,6 +167,12 @@ func NewCmdRun(f *cmdutil.Factory, runF func(*RunOptions) error) *cobra.Command 
 	cmd.Flags().StringArrayVarP(&opts.MagicFields, "field", "F", nil, "Add a string parameter in `key=value` format, respecting @ syntax (see \"gh help api\").")
 	cmd.Flags().StringArrayVarP(&opts.RawFields, "raw-field", "f", nil, "Add a string parameter in `key=value` format")
 	cmd.Flags().BoolVar(&opts.JSON, "json", false, "Read workflow inputs as JSON via STDIN")
+	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "Reconcile inputs against the workflow declaration on the target ref without triggering the workflow")
+	cmdutil.StringEnumFlag(cmd, &opts.DryRunFormat, "dry-run-format", "", dryRunFormatHuman,
+		[]string{dryRunFormatHuman, dryRunFormatJSON}, "Output `format` for the --dry-run conclusion")
+	cmdutil.StringEnumFlag(cmd, &opts.OnDefinitionError, "on-definition-error", "", definitionErrorProceed,
+		[]string{definitionErrorProceed, definitionErrorStop},
+		"What to do when the workflow definition cannot be read or parsed on the target ref; \"proceed\" submits the inputs unchanged, \"stop\" aborts. Has no effect with --dry-run")
 
 	_ = cmdutil.RegisterBranchCompletionFlags(f.GitClient, cmd, "ref")
 
@@ -167,28 +201,49 @@ func magicFieldValue(v string, opts RunOptions) (string, error) {
 	return v, nil
 }
 
-// TODO copypasta from gh api
-func parseFields(opts RunOptions) (map[string]string, error) {
-	params := make(map[string]string)
-	for _, f := range opts.RawFields {
-		key, value, err := parseField(f)
+// flagProvisions turns -f/--raw-field and -F/--field flags into provisions,
+// preserving the existing precedence: raw fields are parsed first and magic
+// fields override same-named raw fields. Order follows first occurrence of a
+// name, so reports are deterministic and match parseFields' last-wins map.
+func flagProvisions(opts RunOptions) ([]inputProvision, error) {
+	order := []string{}
+	values := map[string]string{}
+
+	add := func(f string, magic bool) error {
+		key, raw, err := parseField(f)
 		if err != nil {
-			return params, err
+			return err
 		}
-		params[key] = value
+		value := raw
+		if magic {
+			value, err = magicFieldValue(raw, opts)
+			if err != nil {
+				return fmt.Errorf("error parsing %q value: %w", key, err)
+			}
+		}
+		if _, seen := values[key]; !seen {
+			order = append(order, key)
+		}
+		values[key] = value
+		return nil
+	}
+
+	for _, f := range opts.RawFields {
+		if err := add(f, false); err != nil {
+			return nil, err
+		}
 	}
 	for _, f := range opts.MagicFields {
-		key, strValue, err := parseField(f)
-		if err != nil {
-			return params, err
+		if err := add(f, true); err != nil {
+			return nil, err
 		}
-		value, err := magicFieldValue(strValue, opts)
-		if err != nil {
-			return params, fmt.Errorf("error parsing %q value: %w", key, err)
-		}
-		params[key] = value
 	}
-	return params, nil
+
+	provisions := make([]inputProvision, 0, len(order))
+	for _, name := range order {
+		provisions = append(provisions, inputProvision{Name: name, Value: values[name], Source: sourceFlag})
+	}
+	return provisions, nil
 }
 
 type InputAnswer struct {
@@ -267,11 +322,6 @@ func runRun(opts *RunOptions) error {
 		return err
 	}
 
-	if opts.Detector == nil {
-		cachedClient := api.NewCachedHTTPClient(c, time.Hour*24)
-		opts.Detector = fd.NewDetector(cachedClient, repo.RepoHost())
-	}
-
 	ref := opts.Ref
 
 	if ref == "" {
@@ -293,17 +343,33 @@ func runRun(opts *RunOptions) error {
 
 	providedInputs := map[string]string{}
 
+	// Flags and standard input may now both supply inputs. Provisions keep
+	// their source so cross-source duplicates can be reported. The final
+	// request body still uses only the same key/value pairs as before.
+	var provisions []inputProvision
+
 	if len(opts.MagicFields)+len(opts.RawFields) > 0 {
-		providedInputs, err = parseFields(*opts)
+		flagInputProvisions, err := flagProvisions(*opts)
 		if err != nil {
 			return err
 		}
-	} else if opts.JSONInput != "" {
-		err := json.Unmarshal([]byte(opts.JSONInput), &providedInputs)
-		if err != nil {
+		provisions = append(provisions, flagInputProvisions...)
+	}
+
+	if opts.JSONInput != "" {
+		stdinInputs := map[string]string{}
+		if err := json.Unmarshal([]byte(opts.JSONInput), &stdinInputs); err != nil {
 			return fmt.Errorf("could not parse provided JSON: %w", err)
 		}
-	} else if opts.Prompt {
+		for _, name := range sortedInputNames(stdinInputs) {
+			provisions = append(provisions, inputProvision{Name: name, Value: stdinInputs[name], Source: sourceStdin})
+		}
+	}
+
+	// The interactive question path collects its own inputs and is never
+	// reconciled again. Dry runs skip it entirely: they reconcile (possibly
+	// against an empty input set) but do not answer dispatch prompts.
+	if len(provisions) == 0 && opts.Prompt && !opts.DryRun {
 		yamlContent, err := shared.GetWorkflowContent(client, repo, *workflow, ref)
 		if err != nil {
 			return fmt.Errorf("unable to fetch workflow file content: %w", err)
@@ -312,6 +378,49 @@ func runRun(opts *RunOptions) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	for _, p := range provisions {
+		providedInputs[p.Name] = p.Value
+	}
+
+	// Inputs supplied outside the interactive prompt are reconciled against
+	// the workflow declaration before dispatch. Dry runs always reconcile,
+	// even with no inputs, so scripts can precheck required inputs.
+	if opts.DryRun || len(provisions) > 0 {
+		report := reconcileWorkflow(client, repo, workflow, ref, provisions)
+
+		if opts.DryRun {
+			if opts.DryRunFormat == dryRunFormatJSON {
+				if err := writeJSONReport(opts.IO.Out, report); err != nil {
+					return err
+				}
+			} else {
+				writeHumanReport(opts.IO.Out, report)
+			}
+			if !report.Complete || report.hasFindings() {
+				// The conclusion is already printed above; exit non-zero
+				// without another error message.
+				return cmdutil.SilentError
+			}
+			return nil
+		}
+
+		if !report.Complete {
+			if opts.OnDefinitionError == definitionErrorStop {
+				return incompleteSubmitError(report)
+			}
+			fmt.Fprintf(opts.IO.ErrOut,
+				"warning: input reconciliation for %s at %s could not be completed: %s; submitting inputs unchanged\n",
+				workflow.Base(), ref, report.IncompleteReason)
+		} else if report.hasFindings() {
+			return blockingError(report)
+		}
+	}
+
+	if opts.Detector == nil {
+		cachedClient := api.NewCachedHTTPClient(c, time.Hour*24)
+		opts.Detector = fd.NewDetector(cachedClient, repo.RepoHost())
 	}
 
 	features, err := opts.Detector.ActionsFeatures()
@@ -402,15 +511,40 @@ type WorkflowInput struct {
 	Options     []string
 }
 
+// specErrorKind classifies a failure to interpret a workflow definition so
+// reconciliation can report a precise reason without matching error text.
+type specErrorKind int
+
+const (
+	specInvalidYAML specErrorKind = iota
+	specNoOnKey
+	specNotDispatch
+	specMalformed
+)
+
+// specParseError preserves the exact messages produced by findInputs while
+// also carrying a machine-readable failure kind.
+type specParseError struct {
+	kind    specErrorKind
+	message string
+}
+
+func (e *specParseError) Error() string {
+	return e.message
+}
+
 func findInputs(yamlContent []byte) ([]WorkflowInput, error) {
 	var rootNode yaml.Node
 	err := yaml.Unmarshal(yamlContent, &rootNode)
 	if err != nil {
-		return nil, fmt.Errorf("unable to parse workflow YAML: %w", err)
+		return nil, &specParseError{
+			kind:    specInvalidYAML,
+			message: fmt.Sprintf("unable to parse workflow YAML: %v", err),
+		}
 	}
 
 	if len(rootNode.Content) != 1 {
-		return nil, errors.New("invalid YAML file")
+		return nil, &specParseError{kind: specInvalidYAML, message: "invalid YAML file"}
 	}
 
 	var onKeyNode *yaml.Node
@@ -460,11 +594,14 @@ func findInputs(yamlContent []byte) ([]WorkflowInput, error) {
 	}
 
 	if onKeyNode == nil {
-		return nil, errors.New("invalid workflow: no 'on' key")
+		return nil, &specParseError{kind: specNoOnKey, message: "invalid workflow: no 'on' key"}
 	}
 
 	if dispatchKeyNode == nil {
-		return nil, errors.New("unable to manually run a workflow without a workflow_dispatch event")
+		return nil, &specParseError{
+			kind:    specNotDispatch,
+			message: "unable to manually run a workflow without a workflow_dispatch event",
+		}
 	}
 
 	out := []WorkflowInput{}
@@ -477,12 +614,18 @@ func findInputs(yamlContent []byte) ([]WorkflowInput, error) {
 
 	err = inputsMapNode.Decode(&m)
 	if err != nil {
-		return nil, fmt.Errorf("could not decode workflow inputs: %w", err)
+		return nil, &specParseError{
+			kind:    specMalformed,
+			message: fmt.Sprintf("could not decode workflow inputs: %v", err),
+		}
 	}
 
 	for name, input := range m {
 		if input.Type == "choice" && len(input.Options) == 0 {
-			return nil, fmt.Errorf("workflow input %q is of type choice, but has no options", name)
+			return nil, &specParseError{
+				kind:    specMalformed,
+				message: fmt.Sprintf("workflow input %q is of type choice, but has no options", name),
+			}
 		}
 		out = append(out, WorkflowInput{
 			Name:        name,
