@@ -17,6 +17,7 @@ import (
 	readDirCmd "github.com/cli/cli/v2/pkg/cmd/repo/read-dir"
 	readFileCmd "github.com/cli/cli/v2/pkg/cmd/repo/read-file"
 	repoRenameCmd "github.com/cli/cli/v2/pkg/cmd/repo/rename"
+	repoResolveCmd "github.com/cli/cli/v2/pkg/cmd/repo/resolve"
 	repoDefaultCmd "github.com/cli/cli/v2/pkg/cmd/repo/setdefault"
 	repoSyncCmd "github.com/cli/cli/v2/pkg/cmd/repo/sync"
 	repoUnarchiveCmd "github.com/cli/cli/v2/pkg/cmd/repo/unarchive"
@@ -56,6 +57,7 @@ func NewCmdRepo(f *cmdutil.Factory) *cobra.Command {
 		repoCloneCmd.NewCmdClone(f, nil),
 		repoForkCmd.NewCmdFork(f, nil),
 		repoDefaultCmd.NewCmdSetDefault(f, nil),
+		repoResolveCmd.NewCmdResolve(f, nil),
 		repoSyncCmd.NewCmdSync(f, nil),
 		repoEditCmd.NewCmdEdit(f, nil),
 		readDirCmd.NewCmdReadDir(f, nil),

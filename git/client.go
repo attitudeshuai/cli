@@ -193,6 +193,41 @@ func (c *Client) Remotes(ctx context.Context) (RemoteSet, error) {
 	return remotes, nil
 }
 
+// RemoteResolutionRecords returns the remote.<name>.gh-resolved config values
+// keyed by git remote name. Unlike Remotes, it includes records whose remote
+// has been renamed or deleted, which the ordinary resolution silently drops.
+// Callers identify those stale records by cross-referencing the current remote
+// set. It performs a read-only git config query.
+func (c *Client) RemoteResolutionRecords(ctx context.Context) (map[string]string, error) {
+	configArgs := []string{"config", "--get-regexp", `^remote\..*\.gh-resolved$`}
+	configCmd, err := c.Command(ctx, configArgs...)
+	if err != nil {
+		return nil, err
+	}
+	configOut, configErr := configCmd.Output()
+	if configErr != nil {
+		// Ignore exit code 1 as it means there are no resolved remotes.
+		var gitErr *GitError
+		if ok := errors.As(configErr, &gitErr); ok && gitErr.ExitCode != 1 {
+			return nil, gitErr
+		}
+	}
+
+	records := map[string]string{}
+	for _, line := range outputLines(configOut) {
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		keyParts := strings.SplitN(parts[0], ".", 3)
+		if len(keyParts) < 3 || keyParts[0] != "remote" {
+			continue
+		}
+		records[keyParts[1]] = parts[1]
+	}
+	return records, nil
+}
+
 func (c *Client) UpdateRemoteURL(ctx context.Context, name, url string) error {
 	args := []string{"remote", "set-url", name, url}
 	cmd, err := c.Command(ctx, args...)
