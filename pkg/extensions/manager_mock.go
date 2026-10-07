@@ -46,6 +46,9 @@ var _ ExtensionManager = &ExtensionManagerMock{}
 //			UpgradeFunc: func(name string, force bool) error {
 //				panic("mock out the Upgrade method")
 //			},
+//			UpgradeWithReportFunc: func(name string, force bool, opts UpgradeOptions) (*UpgradeReport, error) {
+//				panic("mock out the UpgradeWithReport method")
+//			},
 //		}
 //
 //		// use mockedExtensionManager in code that requires ExtensionManager
@@ -79,6 +82,9 @@ type ExtensionManagerMock struct {
 
 	// UpgradeFunc mocks the Upgrade method.
 	UpgradeFunc func(name string, force bool) error
+
+	// UpgradeWithReportFunc mocks the UpgradeWithReport method.
+	UpgradeWithReportFunc func(name string, force bool, opts UpgradeOptions) (*UpgradeReport, error)
 
 	// calls tracks calls to the methods.
 	calls struct {
@@ -135,16 +141,26 @@ type ExtensionManagerMock struct {
 			// Force is the force argument value.
 			Force bool
 		}
+		// UpgradeWithReport holds details about calls to the UpgradeWithReport method.
+		UpgradeWithReport []struct {
+			// Name is the name argument value.
+			Name string
+			// Force is the force argument value.
+			Force bool
+			// Opts is the opts argument value.
+			Opts UpgradeOptions
+		}
 	}
-	lockCreate           sync.RWMutex
-	lockDispatch         sync.RWMutex
-	lockEnableDryRunMode sync.RWMutex
-	lockInstall          sync.RWMutex
-	lockInstallLocal     sync.RWMutex
-	lockList             sync.RWMutex
-	lockRemove           sync.RWMutex
-	lockUpdateDir        sync.RWMutex
-	lockUpgrade          sync.RWMutex
+	lockCreate              sync.RWMutex
+	lockDispatch            sync.RWMutex
+	lockEnableDryRunMode    sync.RWMutex
+	lockInstall             sync.RWMutex
+	lockInstallLocal        sync.RWMutex
+	lockList                sync.RWMutex
+	lockRemove              sync.RWMutex
+	lockUpdateDir           sync.RWMutex
+	lockUpgrade             sync.RWMutex
+	lockUpgradeWithReport   sync.RWMutex
 }
 
 // Create calls CreateFunc.
@@ -446,5 +462,45 @@ func (mock *ExtensionManagerMock) UpgradeCalls() []struct {
 	mock.lockUpgrade.RLock()
 	calls = mock.calls.Upgrade
 	mock.lockUpgrade.RUnlock()
+	return calls
+}
+
+// UpgradeWithReport calls UpgradeWithReportFunc.
+func (mock *ExtensionManagerMock) UpgradeWithReport(name string, force bool, opts UpgradeOptions) (*UpgradeReport, error) {
+	if mock.UpgradeWithReportFunc == nil {
+		panic("ExtensionManagerMock.UpgradeWithReportFunc: method is nil but ExtensionManager.UpgradeWithReport was just called")
+	}
+	callInfo := struct {
+		Name  string
+		Force bool
+		Opts  UpgradeOptions
+	}{
+		Name:  name,
+		Force: force,
+		Opts:  opts,
+	}
+	mock.lockUpgradeWithReport.Lock()
+	mock.calls.UpgradeWithReport = append(mock.calls.UpgradeWithReport, callInfo)
+	mock.lockUpgradeWithReport.Unlock()
+	return mock.UpgradeWithReportFunc(name, force, opts)
+}
+
+// UpgradeWithReportCalls gets all the calls that were made to UpgradeWithReport.
+// Check the length with:
+//
+//	len(mockedExtensionManager.UpgradeWithReportCalls())
+func (mock *ExtensionManagerMock) UpgradeWithReportCalls() []struct {
+	Name  string
+	Force bool
+	Opts  UpgradeOptions
+} {
+	var calls []struct {
+		Name  string
+		Force bool
+		Opts  UpgradeOptions
+	}
+	mock.lockUpgradeWithReport.RLock()
+	calls = mock.calls.UpgradeWithReport
+	mock.lockUpgradeWithReport.RUnlock()
 	return calls
 }

@@ -458,6 +458,31 @@ var upToDateError = errors.New("already up to date")
 var noExtensionsInstalledError = errors.New("no extensions installed")
 
 func (m *Manager) Upgrade(name string, force bool) error {
+	// UpgradeWithReport owns the upgrade behavior; this wrapper preserves the legacy
+	// interface for consumers that only need the error.
+	_, err := m.UpgradeWithReport(name, force, extensions.UpgradeOptions{})
+	return err
+}
+
+// UpgradeWithReport runs the requested upgrade and returns the structured report built
+// from the run's transaction journal. The report is nil when an error occurs before the
+// transaction is created, such as lock contention or failed preflight.
+func (m *Manager) UpgradeWithReport(name string, force bool, opts extensions.UpgradeOptions) (*extensions.UpgradeReport, error) {
+	unlock, err := m.acquireUpgradeLock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	// This bridge implementation delegates to the existing path until the transaction
+	// flow is wired in; later tasks replace this body.
+	if err := m.upgrade(name, force); err != nil {
+		return nil, err
+	}
+	return &extensions.UpgradeReport{}, nil
+}
+
+func (m *Manager) upgrade(name string, force bool) error {
 	// Fetch metadata during list only when upgrading all extensions.
 	// This is a performance improvement so that we don't make a
 	// bunch of unnecessary network requests when trying to upgrade a single extension.
